@@ -422,7 +422,8 @@ class AlphaFold(hk.Module):
       batch,
       is_training,
       return_representations=False,
-      safe_key=None):
+      safe_key=None,
+      prev=None):
 
     c = self.config
     impl = AlphaFoldIteration(c, self.global_config)
@@ -435,6 +436,27 @@ class AlphaFold(hk.Module):
     assert isinstance(batch, dict)
     num_res = batch['aatype'].shape[0]
 
+    ### added for saving information of intermediate recycles
+    if self.config.save_recycled:
+      recycled_structs = jnp.zeros(
+        [self.config.num_recycle, num_res, residue_constants.atom_type_num, 3],
+      )
+      recycled_structs_mask = jnp.zeros(
+        [self.config.num_recycle, num_res, 37],
+      )
+      predicted_lddt_logits = jnp.zeros(
+        [self.config.num_recycle, num_res, 50],
+      )
+      tol_values = jnp.zeros([self.config.num_recycle])
+      recycled_info = {
+        "atom_positions": recycled_structs,
+        "atom_mask": recycled_structs_mask,
+        "plddt": predicted_lddt_logits,
+        "tol_values": tol_values
+      }
+    else:
+      recycled_info = {}
+
     def get_prev(ret):
       new_prev = {
           'prev_pos':
@@ -442,27 +464,37 @@ class AlphaFold(hk.Module):
           'prev_msa_first_row': ret['representations']['msa_first_row'],
           'prev_pair': ret['representations']['pair'],
       }
-      return jax.tree_map(jax.lax.stop_gradient, new_prev)
+      return jax.tree_map(jax.lax.stop_gradient, new_prev), recycled_info
 
-    def apply_network(prev, safe_key):
+    def apply_network(prev, safe_key, recycle_idx, recycled_info, tol_value):
       recycled_batch = {**batch, **prev}
-      return impl(
+      r = impl(
           batch=recycled_batch,
           is_training=is_training,
           safe_key=safe_key)
 
-    prev = {}
-    emb_config = self.config.embeddings_and_evoformer
-    if emb_config.recycle_pos:
-      prev['prev_pos'] = jnp.zeros(
-          [num_res, residue_constants.atom_type_num, 3])
-    if emb_config.recycle_features:
-      prev['prev_msa_first_row'] = jnp.zeros(
-          [num_res, emb_config.msa_channel])
-      prev['prev_pair'] = jnp.zeros(
-          [num_res, num_res, emb_config.pair_channel])
+      if self.config.save_recycled:
+        recycled_info['atom_positions'] = recycled_info['atom_positions'].at[recycle_idx].set(
+          r['structure_module']['final_atom_positions'])
+        recycled_info['atom_mask'] = recycled_info['atom_mask'].at[recycle_idx].set(
+          r['structure_module']['final_atom_mask'])
+        recycled_info['plddt'] = recycled_info['plddt'].at[recycle_idx].set(
+          r['predicted_lddt']['logits'])
+        recycled_info['tol_values'] = recycled_info['tol_values'].at[recycle_idx].set(tol_value)
+      return r, recycled_info
 
     if self.config.num_recycle:
+      emb_config = self.config.embeddings_and_evoformer
+      if prev is None:
+        prev = {
+            'prev_pos': jnp.zeros(
+                [num_res, residue_constants.atom_type_num, 3]),
+            'prev_msa_first_row': jnp.zeros(
+                [num_res, emb_config.msa_channel]),
+            'prev_pair': jnp.zeros(
+                [num_res, num_res, emb_config.pair_channel]),
+        }
+
       if 'num_iter_recycling' in batch:
         # Training time: num_iter_recycling is in batch.
         # Value for each ensemble batch is the same, so arbitrarily taking 0-th.
@@ -474,53 +506,57 @@ class AlphaFold(hk.Module):
       else:
         # Eval mode or tests: use the maximum number of iterations.
         num_iter = c.num_recycle
+      #I opt to use the original code from https://github.com/FreshAirTonight/af2complex/blob/main/src/alphafold/model/modules_multimer.py
+      def pw_dist(a):
+        a_norm = jnp.square(a).sum(-1)
+        return jnp.sqrt(jnp.abs(a_norm[:,None] + a_norm[None,:] - 2 * a @ a.T))
+
+      def recycle_body(x):
+        i, tol, _, prev, safe_key, recycled = x
+        safe_key1, safe_key2 = safe_key.split() if c.resample_msa_in_recycling else safe_key.duplicate()  # pylint: disable=line-too-long
+        ret, recycled = apply_network(prev=prev, safe_key=safe_key2, recycle_idx=i,
+                recycled_info=recycled, tol_value=tol)
+        prev_, recycled_ = get_prev(ret)
+        ca,ca_ = prev["prev_pos"][:,1,:], prev_["prev_pos"][:,1,:]
+        tol_ = jnp.sqrt(jnp.square(pw_dist(ca) - pw_dist(ca_)).mean())
+        return i+1, tol_, prev, prev_, safe_key1, recycled
 
       def distances(points):
         """Compute all pairwise distances for a set of points."""
         return jnp.sqrt(jnp.sum((points[:, None] - points[None, :])**2,
                                 axis=-1))
 
-      def recycle_body(x):
-        i, _, prev, safe_key = x
-        safe_key1, safe_key2 = safe_key.split() if c.resample_msa_in_recycling else safe_key.duplicate()  # pylint: disable=line-too-long
-        ret = apply_network(prev=prev, safe_key=safe_key2)
-        return i+1, prev, get_prev(ret), safe_key1
-
       def recycle_cond(x):
-        i, prev, next_in, _ = x
-        ca_idx = residue_constants.atom_order['CA']
-        sq_diff = jnp.square(distances(prev['prev_pos'][:, ca_idx, :]) -
-                             distances(next_in['prev_pos'][:, ca_idx, :]))
-        mask = batch['seq_mask'][:, None] * batch['seq_mask'][None, :]
-        sq_diff = utils.mask_mean(mask, sq_diff)
-        # Early stopping criteria based on criteria used in
-        # AF2Complex: https://www.nature.com/articles/s41467-022-29394-2
-        diff = jnp.sqrt(sq_diff + 1e-8)  # avoid bad numerics giving negatives
+        i, tol, prev, next_in, _, _ = x
         less_than_max_recycles = (i < num_iter)
         has_exceeded_tolerance = (
-            (i == 0) | (diff > c.recycle_early_stop_tolerance))
+            (i == 0) | (tol > c.recycle_early_stop_tolerance))
         return less_than_max_recycles & has_exceeded_tolerance
 
       if hk.running_init():
-        num_recycles, _, prev, safe_key = recycle_body(
-            (0, prev, prev, safe_key))
+        num_recycles, tol, _, prev, safe_key, recycled_info = recycle_body(
+            (0, jnp.inf, prev, prev, safe_key, recycled_info))
       else:
-        num_recycles, _, prev, safe_key = hk.while_loop(
+        num_recycles, tol, _, prev, safe_key, recycled_info = hk.while_loop(
             recycle_cond,
             recycle_body,
-            (0, prev, prev, safe_key))
+            (0, jnp.inf, prev, prev, safe_key, recycled_info))
     else:
+      if prev is None:
+        prev = {}
       # No recycling.
-      num_recycles = 0
+      num_iter = 0
+      (num_recycles, tol) = 0, jnp.inf
 
     # Run extra iteration.
-    ret = apply_network(prev=prev, safe_key=safe_key)
+    ret, recycled_info = apply_network(prev=prev, safe_key=safe_key,
+        recycle_idx=num_iter, recycled_info=recycled_info, tol_value=tol)
 
     if not return_representations:
       del ret['representations']
     ret['num_recycles'] = num_recycles
 
-    return ret
+    return ret, (num_recycles, tol, recycled_info)
 
 
 class EmbeddingsAndEvoformer(hk.Module):

@@ -177,6 +177,7 @@ def sharded_apply(
       return new_outputs, ()
 
     slice_starts = jnp.arange(0, in_size - shard_size + 1, shard_size)
+    if(shard_size > in_size): print('***********  WARNING: ************ shard_size > in_size: ',shard_size,in_size)
 
     def allocate_buffer(dtype, shape):
       return jnp.zeros(shape, dtype=dtype)

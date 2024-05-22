@@ -290,7 +290,8 @@ class AlphaFold(hk.Module):
       is_training,
       compute_loss=False,
       ensemble_representations=False,
-      return_representations=False):
+      return_representations=False,
+      prev=None):
     """Run the AlphaFold model.
 
     Arguments:
@@ -314,18 +315,49 @@ class AlphaFold(hk.Module):
 
     impl = AlphaFoldIteration(self.config, self.global_config)
     batch_size, num_residues = batch['aatype'].shape
+    if self.config.save_recycled:
+      recycled_structs = jnp.zeros(
+        [self.config.num_recycle, num_residues, residue_constants.atom_type_num, 3],
+      )
+      recycled_structs_mask = jnp.zeros(
+        [self.config.num_recycle, num_residues, 37],
+      )
+      predicted_lddt_logits = jnp.zeros(
+        [self.config.num_recycle, num_residues, 50],
+      )
+      num_bins = self.config.heads.predicted_aligned_error.num_bins
+      predicted_aligned_error_logits = jnp.zeros(
+        [self.config.num_recycle, num_residues, num_residues, num_bins],
+      )
+      predicted_aligned_error_breaks = jnp.zeros(
+        [self.config.num_recycle, num_bins - 1],
+      )
+      tol_values = jnp.zeros([self.config.num_recycle])
+      recycled_info = {
+        "atom_positions": recycled_structs,
+        "atom_mask": recycled_structs_mask,
+        "plddt": predicted_lddt_logits,
+        "pred_aligned_error_logits": predicted_aligned_error_logits,
+        "pred_aligned_error_breaks": predicted_aligned_error_breaks,
+        "tol_values": tol_values
+      }
+    else:
+      recycled_info = {}
 
     def get_prev(ret):
+      ret, recycled_info = ret
       new_prev = {
           'prev_pos':
               ret['structure_module']['final_atom_positions'],
           'prev_msa_first_row': ret['representations']['msa_first_row'],
           'prev_pair': ret['representations']['pair'],
       }
-      return jax.tree_map(jax.lax.stop_gradient, new_prev)
+      return jax.tree_map(jax.lax.stop_gradient, new_prev), recycled_info
 
     def do_call(prev,
                 recycle_idx,
+                recycled_info,
+                tol_value,
                 compute_loss=compute_loss):
       if self.config.resample_msa_in_recycling:
         num_ensemble = batch_size // (self.config.num_recycle + 1)
@@ -340,25 +372,38 @@ class AlphaFold(hk.Module):
 
       non_ensembled_batch = jax.tree_map(lambda x: x, prev)
 
-      return impl(
+      r = impl(
           ensembled_batch=ensembled_batch,
           non_ensembled_batch=non_ensembled_batch,
           is_training=is_training,
           compute_loss=compute_loss,
           ensemble_representations=ensemble_representations)
 
-    prev = {}
-    emb_config = self.config.embeddings_and_evoformer
-    if emb_config.recycle_pos:
-      prev['prev_pos'] = jnp.zeros(
-          [num_residues, residue_constants.atom_type_num, 3])
-    if emb_config.recycle_features:
-      prev['prev_msa_first_row'] = jnp.zeros(
-          [num_residues, emb_config.msa_channel])
-      prev['prev_pair'] = jnp.zeros(
-          [num_residues, num_residues, emb_config.pair_channel])
+      if self.config.save_recycled:
+        recycled_info['atom_positions'] = recycled_info['atom_positions'].at[recycle_idx].set(
+          r['structure_module']['final_atom_positions'])
+        recycled_info['atom_mask'] = recycled_info['atom_mask'].at[recycle_idx].set(
+          r['structure_module']['final_atom_mask'])
+        recycled_info['plddt'] = recycled_info['plddt'].at[recycle_idx].set(
+          r['predicted_lddt']['logits'])
+        recycled_info['pred_aligned_error_logits'] = recycled_info['pred_aligned_error_logits'].at[recycle_idx].set(
+          r['predicted_aligned_error']['logits'])
+        recycled_info['pred_aligned_error_breaks'] = recycled_info['pred_aligned_error_breaks'].at[recycle_idx].set(
+          r['predicted_aligned_error']['breaks'])
+        recycled_info['tol_values'] = recycled_info['tol_values'].at[recycle_idx].set(tol_value)
+      return r, recycled_info
 
     if self.config.num_recycle:
+      emb_config = self.config.embeddings_and_evoformer
+      if prev is None:
+        prev = {
+            'prev_pos': jnp.zeros(
+                [num_residues, residue_constants.atom_type_num, 3]),
+            'prev_msa_first_row': jnp.zeros(
+                [num_residues, emb_config.msa_channel]),
+            'prev_pair': jnp.zeros(
+                [num_residues, num_residues, emb_config.pair_channel]),
+        }
       if 'num_iter_recycling' in batch:
         # Training time: num_iter_recycling is in batch.
         # The value for each ensemble batch is the same, so arbitrarily taking
@@ -372,28 +417,41 @@ class AlphaFold(hk.Module):
         # Eval mode or tests: use the maximum number of iterations.
         num_iter = self.config.num_recycle
 
-      body = lambda x: (x[0] + 1,  # pylint: disable=g-long-lambda
-                        get_prev(do_call(x[1], recycle_idx=x[0],
-                                         compute_loss=False)))
+      def pw_dist(a):
+        a_norm = jnp.square(a).sum(-1)
+        return jnp.sqrt(jnp.abs(a_norm[:,None] + a_norm[None,:] - 2 * a @ a.T))
+
+#      body = lambda x: (x[0] + 1,  # pylint: disable=g-long-lambda
+#                        get_prev(do_call(x[1], recycle_idx=x[0],
+#                                         compute_loss=False)))
+      def body(x):
+        n, tol, prev, recycled = x
+        prev_, recycled_ = get_prev(do_call(prev, recycle_idx=n,
+                    compute_loss=False, recycled_info=recycled, tol_value=tol))
+        ca,ca_ = prev["prev_pos"][:,1,:], prev_["prev_pos"][:,1,:]
+        tol_ = jnp.sqrt(jnp.square(pw_dist(ca) - pw_dist(ca_)).mean())
+        return n+1, tol_, prev_, recycled_
+
       if hk.running_init():
         # When initializing the Haiku module, run one iteration of the
         # while_loop to initialize the Haiku modules used in `body`.
-        _, prev = body((0, prev))
+        recycles, tol, prev, recycled_info = body((0, jnp.inf, prev, recycled_info))
       else:
-        _, prev = hk.while_loop(
-            lambda x: x[0] < num_iter,
-            body,
-            (0, prev))
+        recycles, tol, prev, recycled_info  = hk.while_loop(
+          lambda x: ((x[0] < num_iter) & (x[1] > self.config.recycle_tol)),
+          body,
+          (0, jnp.inf, prev, recycled_info))
     else:
       num_iter = 0
+      (recycles,tol) = 0, jnp.inf
 
-    ret = do_call(prev=prev, recycle_idx=num_iter)
+    ret, recycled_info = do_call(prev=prev, recycle_idx=num_iter, recycled_info=recycled_info, tol_value=tol)
     if compute_loss:
       ret = ret[0], [ret[1]]
 
     if not return_representations:
       del (ret[0] if compute_loss else ret)['representations']  # pytype: disable=unsupported-operands
-    return ret
+    return ret, (recycles, tol, recycled_info)
 
 
 class TemplatePairStack(hk.Module):

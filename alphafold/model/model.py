@@ -72,19 +72,22 @@ class RunModel:
     self.multimer_mode = config.model.global_config.multimer_mode
 
     if self.multimer_mode:
-      def _forward_fn(batch):
+      def _forward_fn(batch, prev):
         model = modules_multimer.AlphaFold(self.config.model)
         return model(
             batch,
-            is_training=False)
+            is_training=False,
+            prev=prev)
     else:
-      def _forward_fn(batch):
+      def _forward_fn(batch, prev):
         model = modules.AlphaFold(self.config.model)
         return model(
             batch,
             is_training=False,
             compute_loss=False,
-            ensemble_representations=True)
+            ensemble_representations=True,
+            return_representations=True,
+            prev=prev)
 
     self.apply = jax.jit(hk.transform(_forward_fn).apply)
     self.init = jax.jit(hk.transform(_forward_fn).init)
@@ -149,7 +152,7 @@ class RunModel:
   def predict(self,
               feat: features.FeatureDict,
               random_seed: int,
-              ) -> Mapping[str, Any]:
+              prev=None, prev_ckpt_iter=0) -> Mapping[str, Any]:
     """Makes a prediction by inferencing the model on the provided features.
 
     Args:
@@ -164,7 +167,12 @@ class RunModel:
     self.init_params(feat)
     logging.info('Running predict with shape(feat) = %s',
                  tree.map_structure(lambda x: x.shape, feat))
-    result = self.apply(self.params, jax.random.PRNGKey(random_seed), feat)
+    feat = {k: v for k, v in feat.items() if v.dtype != 'O'}
+    result, recycles = self.apply(self.params, jax.random.PRNGKey(random_seed), feat, prev=prev)
+
+    if self.checkpoint_file is not None:
+      if prev_ckpt_iter: prev_ckpt_iter += 1
+      prev_iter = prev_ckpt_iter + recycles[0]
 
     # This block is to ensure benchmark timings are accurate. Some blocking is
     # already happening when computing get_confidence_metrics, and this ensures
@@ -174,4 +182,34 @@ class RunModel:
         get_confidence_metrics(result, multimer_mode=self.multimer_mode))
     logging.info('Output shape was %s',
                  tree.map_structure(lambda x: x.shape, result))
-    return result
+
+    if self.config.model.save_recycled:
+      *_, recycled_info = recycles
+    # must convert jax array to np array, otherwise some interplay between
+    # jax array and the loops in the AF2Complex metric functions dramatically slow downs the calculations
+      structs = np.asarray(recycled_info['atom_positions'])
+      structs_masks = np.asarray(recycled_info['atom_mask'])
+      plddt = np.asarray(recycled_info['plddt'])
+      tol_values = np.asarray(recycled_info['tol_values'])
+      recycled_info_ = []
+
+      for i, (s, m, p, tol_val) in enumerate(zip(
+        structs, structs_masks, plddt, tol_values
+      )):
+        pl= confidence.compute_plddt(p)
+        r = {
+          "structure_module": {
+            "final_atom_positions": s,
+            "final_atom_mask": m,
+          },
+          "plddt": pl,
+          "tol_val": tol_val,
+        }
+        if i < result['num_recycles']:
+          logging.info('recycle# %d, diff plddt values: %f %f',i,tol_values[i].item(),pl.mean())
+
+        recycled_info_.append(r)
+      recycles = (*_, recycled_info_)
+      recycled_info.clear()
+
+    return result, recycles

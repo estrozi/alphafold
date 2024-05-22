@@ -265,14 +265,16 @@ def _find_template_in_pdb(
   chain_sequence = mmcif_object.chain_to_seqres.get(template_chain_id)
   if chain_sequence and (template_sequence in chain_sequence):
     logging.info(
-        'Found an exact template match %s_%s.', pdb_id, template_chain_id)
+#        'Found an exact template match %s_%s.', pdb_id, template_chain_id)
+        'Found an exact template match https://www.rcsb.org/structure/%s chain %s', pdb_id, template_chain_id)
     mapping_offset = chain_sequence.find(template_sequence)
     return chain_sequence, template_chain_id, mapping_offset
 
   # Try if there is an exact match in the (sub)sequence only.
   for chain_id, chain_sequence in mmcif_object.chain_to_seqres.items():
     if chain_sequence and (template_sequence in chain_sequence):
-      logging.info('Found a sequence-only match %s_%s.', pdb_id, chain_id)
+      #logging.info('Found a sequence-only match %s_%s.', pdb_id, chain_id)
+      logging.info('Found a sequence-only match https://www.rcsb.org/structure/%s chain %s', pdb_id, chain_id)
       mapping_offset = chain_sequence.find(template_sequence)
       return chain_sequence, chain_id, mapping_offset
 
@@ -283,13 +285,15 @@ def _find_template_in_pdb(
   for chain_id, chain_sequence in mmcif_object.chain_to_seqres.items():
     match = re.search(regex, chain_sequence)
     if match:
-      logging.info('Found a fuzzy sequence-only match %s_%s.', pdb_id, chain_id)
+      #logging.info('Found a fuzzy sequence-only match %s_%s.', pdb_id, chain_id)
+      logging.info('Found a fuzzy sequence-only match https://www.rcsb.org/structure/%s chain %s', pdb_id, chain_id)
       mapping_offset = match.start()
       return chain_sequence, chain_id, mapping_offset
 
   # No hits, raise an error.
   raise SequenceNotInTemplateError(
-      'Could not find the template sequence in %s_%s. Template sequence: %s, '
+      #'Could not find the template sequence in %s_%s. Template sequence: %s, '
+      'Could not find the template sequence in https://www.rcsb.org/structure/%s chain %s. Template sequence: %s, '
       'chain_to_seqres: %s' % (pdb_id, template_chain_id, template_sequence,
                                mmcif_object.chain_to_seqres))
 

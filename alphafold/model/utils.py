@@ -108,6 +108,7 @@ def mask_mean(mask, value, axis=None, drop_mask_channel=False, eps=1e-10):
 
 def flat_params_to_haiku(params: Mapping[str, np.ndarray]) -> hk.Params:
   """Convert a dictionary of NumPy arrays to Haiku parameters."""
+  #LFE: here is the place to print/inspect AF2 models parameters. Experiments already perfomed at utils.py.LFE
   hk_params = {}
   for path, array in params.items():
     scope, name = path.split('//')

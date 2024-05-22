@@ -33,6 +33,7 @@ from alphafold.common import residue_constants
 from alphafold.data import pipeline
 from alphafold.data import pipeline_multimer
 from alphafold.data import templates
+from alphafold.data import parsers
 from alphafold.data.tools import hhsearch
 from alphafold.data.tools import hmmsearch
 from alphafold.model import config
@@ -41,12 +42,12 @@ from alphafold.model import model
 from alphafold.relax import relax
 import jax.numpy as jnp
 import numpy as np
-
+import gnuplotlib
+import subprocess
+import matplotlib.pyplot as plt
 # Internal import (7716).
 
 logging.set_verbosity(logging.INFO)
-
-
 @enum.unique
 class ModelsToRelax(enum.Enum):
   ALL = 0
@@ -142,6 +143,14 @@ flags.DEFINE_boolean('use_gpu_relax', None, 'Whether to relax on GPU. '
                      'Relax on GPU can be much faster than CPU, so it is '
                      'recommended to enable if possible. GPUs must be available'
                      ' if this setting is enabled.')
+flags.DEFINE_integer('n_parallel_msa', 3, 'Number of parallel runs of MSA tools.')
+flags.DEFINE_integer('save_recycled', 2, '0 - no recycle info saving, 1 - print '
+                   'metrics of intermediate recycles, 2 - additionally saving pdb structures '
+                   'of all recycles, 3 - additionally save all results in pickle '
+                    'dictionaries of each recycling iteration.', lower_bound=0, upper_bound=3)
+flags.DEFINE_string('checkpoint_tag', 'checkpoint', 'Enable checkpoint and use the tag to name '
+                    'files to restart the recycle modeling later.')
+flags.DEFINE_integer('stopat', 6, 'which model to use and when to stop. Allows parallel inference with the 5 models. 0=MSA, 1=model_1_multimer_v3, 2=model_2, 3=model_3, 4=model_4, 5=model_5, 6=up to final part (ranking, etc)')
 
 FLAGS = flags.FLAGS
 
@@ -151,6 +160,7 @@ RELAX_ENERGY_TOLERANCE = 2.39
 RELAX_STIFFNESS = 10.0
 RELAX_EXCLUDE_RESIDUES = []
 RELAX_MAX_OUTER_ITERATIONS = 3
+terminaltype = f"dumb 120,40"
 
 
 def _check_flag(flag_name: str,
@@ -255,8 +265,18 @@ def predict_structure(
   t_0 = time.time()
   feature_dict = data_pipeline.process(
       input_fasta_path=fasta_path,
-      msa_output_dir=msa_output_dir)
+      msa_output_dir=msa_output_dir, stopat=FLAGS.stopat)
   timings['features'] = time.time() - t_0
+
+  msa = feature_dict['msa']
+  nal = (msa != 21).sum(0)
+  gnuplotlib.plot(nal, terminal=terminaltype)
+  if ( (nal < 30).sum(0) > 0 ):
+    logging.info(f'The MSA alignment depth is less than 30 sequences at the '
+                 f'positions below. You may consider spliting into shorter chains.' )
+    logging.info([i for i in range(len(nal)) if nal[i] < 30])
+  if FLAGS.stopat == 0:
+    raise app.UsageError('Using stopat 0 (MSA only)', 0)
 
   # Write out features as a pickled dictionary.
   features_output_path = os.path.join(output_dir, 'features.pkl')
@@ -268,80 +288,163 @@ def predict_structure(
   relaxed_pdbs = {}
   relax_metrics = {}
   ranking_confidences = {}
-
+  prediction_result = None
   # Run the models.
   num_models = len(model_runners)
-  for model_index, (model_name, model_runner) in enumerate(
-      model_runners.items()):
-    logging.info('Running model %s on %s', model_name, fasta_name)
-    t_0 = time.time()
-    model_random_seed = model_index + random_seed * num_models
-    processed_feature_dict = model_runner.process_features(
-        feature_dict, random_seed=model_random_seed)
-    timings[f'process_features_{model_name}'] = time.time() - t_0
-
-    t_0 = time.time()
-    prediction_result = model_runner.predict(processed_feature_dict,
-                                             random_seed=model_random_seed)
-    t_diff = time.time() - t_0
-    timings[f'predict_and_compile_{model_name}'] = t_diff
-    logging.info(
-        'Total JAX model %s on %s predict time (includes compilation time, see --benchmark): %.1fs',
-        model_name, fasta_name, t_diff)
-
-    if benchmark:
+  for model_index, (model_name, model_runner) in enumerate(model_runners.items()):
+    unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+    unrelaxed_proteins_checkpoint_path = os.path.join(output_dir, f'unrelaxed_proteins_{model_name}_checkpoint.pkl')
+    ranking_confidences_checkpoint_path = os.path.join(output_dir, f'ranking_confidences_{model_name}_checkpoint.pkl')
+    if not os.path.exists(os.path.join(output_dir, f'result_{model_name}.pkl')):
+      logging.info('Running model %s on %s', model_name, fasta_name)
+      prev_ckpt = None; prev_ckpt_iter = 0
+      model_runner.checkpoint_file = None
+      if FLAGS.checkpoint_tag:
+        checkpoint_dir  = os.path.join(output_dir, 'checkpoint')
+        model_runner.checkpoint_file = os.path.join(checkpoint_dir, model_name + '_' + FLAGS.checkpoint_tag + ".pkl")
       t_0 = time.time()
-      model_runner.predict(processed_feature_dict,
-                           random_seed=model_random_seed)
+      model_random_seed = model_index + random_seed * num_models
+      processed_feature_dict = model_runner.process_features(
+          feature_dict, random_seed=model_random_seed)
+      timings[f'process_features_{model_name}'] = time.time() - t_0
+
+      t_0 = time.time()
+      prediction_result, (tot_recycle, tol_value, recycled) = model_runner.predict(processed_feature_dict,
+                                                 random_seed=model_random_seed, prev=prev_ckpt,
+                                                 prev_ckpt_iter=prev_ckpt_iter )
+      tot_recycle += prev_ckpt_iter
+
       t_diff = time.time() - t_0
-      timings[f'predict_benchmark_{model_name}'] = t_diff
+      timings[f'predict_and_compile_{model_name}'] = t_diff
       logging.info(
-          'Total JAX model %s on %s predict time (excludes compilation time): %.1fs',
+          'Total JAX model %s on %s predict time (includes compilation time, see --benchmark): %.1fs',
           model_name, fasta_name, t_diff)
 
-    plddt = prediction_result['plddt']
-    _save_confidence_json_file(plddt, output_dir, model_name)
-    ranking_confidences[model_name] = prediction_result['ranking_confidence']
+      if benchmark:
+        t_0 = time.time()
+        model_runner.predict(processed_feature_dict,
+                             random_seed=model_random_seed)
+        t_diff = time.time() - t_0
+        timings[f'predict_benchmark_{model_name}'] = t_diff
+        logging.info(
+            'Total JAX model %s on %s predict time (excludes compilation time): %.1fs',
+            model_name, fasta_name, t_diff)
 
-    if (
-        'predicted_aligned_error' in prediction_result
-        and 'max_predicted_aligned_error' in prediction_result
-    ):
-      pae = prediction_result['predicted_aligned_error']
-      max_pae = prediction_result['max_predicted_aligned_error']
-      _save_pae_json_file(pae, float(max_pae), output_dir, model_name)
+      # output info of intermeidate recycles and save the coordinates
+      if FLAGS.save_recycled:
+        recycle_out_dir = os.path.join(output_dir, "recycled")
+        if FLAGS.save_recycled > 1 and not os.path.exists(recycle_out_dir):
+          try:
+            os.mkdir(recycle_out_dir)
+          except FileExistsError:  # this could happen when multiple runs are working on the same target simultaneously
+            print(f"Warning: tried to create an existing {recycle_out_dir}, ignored")
 
-    # Remove jax dependency from results.
-    np_prediction_result = _jnp_to_np(dict(prediction_result))
+        for rec_idx, rec_dict in enumerate(recycled):
+          if prev_ckpt_iter: rec_idx += prev_ckpt_iter
+          if rec_idx < tot_recycle:
+            if FLAGS.save_recycled > 1:
+              # Set the b-factors to the per-residue plddt
+              final_atom_mask = rec_dict['structure_module']['final_atom_mask']
+              b_factors = rec_dict['plddt'][:, None] * final_atom_mask
 
-    # Save the model outputs.
-    result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
-    with open(result_output_path, 'wb') as f:
-      pickle.dump(np_prediction_result, f, protocol=4)
+              unrelaxed_protein = protein.from_prediction(feature_dict,
+                                    rec_dict,
+                                    b_factors=b_factors,
+                                    remove_leading_feature_dimension=not model_runner.multimer_mode,
+                                    )
 
-    # Add the predicted LDDT in the b-factor column.
-    # Note that higher predicted LDDT value means higher model confidence.
-    plddt_b_factors = np.repeat(
-        plddt[:, None], residue_constants.atom_type_num, axis=-1)
-    unrelaxed_protein = protein.from_prediction(
-        features=processed_feature_dict,
-        result=prediction_result,
-        b_factors=plddt_b_factors,
-        remove_leading_feature_dimension=not model_runner.multimer_mode)
+              unrelaxed_recycle_pdb_path = os.path.join(recycle_out_dir, f"{model_name}_recycled_{rec_idx:02d}.pdb")
+              with open(unrelaxed_recycle_pdb_path, 'w') as f:
+                f.write(protein.to_pdb(unrelaxed_protein))
 
-    unrelaxed_proteins[model_name] = unrelaxed_protein
-    unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
-    unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
-    with open(unrelaxed_pdb_path, 'w') as f:
-      f.write(unrelaxed_pdbs[model_name])
+      plddt = prediction_result['plddt']
+      _save_confidence_json_file(plddt, output_dir, model_name)
+      ranking_confidences[model_name] = prediction_result['ranking_confidence']
 
-    _save_mmcif_file(
-        prot=unrelaxed_protein,
-        output_dir=output_dir,
-        model_name=f'unrelaxed_{model_name}',
-        file_id=str(model_index),
-        model_type=model_type,
-    )
+      if (
+          'predicted_aligned_error' in prediction_result
+          and 'max_predicted_aligned_error' in prediction_result
+      ):
+        pae = prediction_result['predicted_aligned_error']
+        max_pae = prediction_result['max_predicted_aligned_error']
+        _save_pae_json_file(pae, float(max_pae), output_dir, model_name)
+
+      # Remove jax dependency from results.
+      np_prediction_result = _jnp_to_np(dict(prediction_result))
+
+      pae_outputs = {'protein': (np_prediction_result['predicted_aligned_error'], prediction_result['max_predicted_aligned_error'])}
+      pae, max_pae = list(pae_outputs.values())[0]
+      pae_output_path = os.path.join(output_dir, f'unrelaxed_{model_name}_pae.png')
+      fig = plt.figure()
+      fig.set_facecolor('white')
+      plt.imshow(pae, vmin=0., vmax=max_pae)
+      plt.colorbar(fraction=0.46, pad=0.04)
+      plt.title('Predicted Aligned Error')
+      plt.xlabel('Scored residue')
+      plt.ylabel('Aligned residue')
+      plt.savefig(pae_output_path, dpi=300, bbox_inches='tight')
+      logging.info('num_recycles: %d', np_prediction_result['num_recycles'].item() )
+      logging.info('Predicted template modeling score (ptm): %f', np_prediction_result['ptm'].item() )
+      if np_prediction_result['iptm'].item() != 0:
+        logging.info('Multimer interface ptm (iptm): %f', np_prediction_result['iptm'].item() )
+        logging.info('Multimer combined score (0.8*iptm+0.2*ptm): %f', 0.8*np_prediction_result['iptm'].item()+0.2*np_prediction_result['ptm'].item() )
+
+      # Save the model outputs.
+      result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
+      with open(result_output_path, 'wb') as f:
+        pickle.dump(np_prediction_result, f, protocol=4)
+
+      # Add the predicted LDDT in the b-factor column.
+      # Note that higher predicted LDDT value means higher model confidence.
+      plddt_b_factors = np.repeat(
+          plddt[:, None], residue_constants.atom_type_num, axis=-1)
+      unrelaxed_protein = protein.from_prediction(
+          features=processed_feature_dict,
+          result=prediction_result,
+          b_factors=plddt_b_factors,
+          remove_leading_feature_dimension=not model_runner.multimer_mode)
+      _save_mmcif_file(
+          prot=unrelaxed_protein,
+          output_dir=output_dir,
+          model_name=f'unrelaxed_{model_name}',
+          file_id=str(model_index),
+          model_type=model_type,
+      )
+      unrelaxed_proteins[model_name] = unrelaxed_protein
+      unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
+      #unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+      with open(unrelaxed_pdb_path, 'w') as f:
+        f.write(unrelaxed_pdbs[model_name])
+      # save checkpoints
+      with open(unrelaxed_proteins_checkpoint_path, 'wb') as f:
+        pickle.dump(unrelaxed_proteins[model_name], f, protocol=4)
+      with open(ranking_confidences_checkpoint_path, 'wb') as f:
+        pickle.dump(ranking_confidences[model_name], f, protocol=4)
+    else:
+      # read checkpoints
+      with open(unrelaxed_pdb_path, 'r') as f:
+        unrelaxed_pdbs[model_name] = f.read()
+      with open(unrelaxed_proteins_checkpoint_path, 'rb') as f:
+        unrelaxed_proteins[model_name] = pickle.load(f)
+      with open(ranking_confidences_checkpoint_path, 'rb') as f:
+        ranking_confidences[model_name] = pickle.load(f)
+
+  if FLAGS.stopat < 6:
+    raise app.UsageError('Interrupting because stopat < 6', 0)
+  label = None
+  if not prediction_result is None:
+    label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
+
+  prediction_result_label_checkpoint_path = os.path.join(output_dir, f'prediction_result_label_checkpoint.pkl')
+  if not os.path.exists(prediction_result_label_checkpoint_path):
+    if not label is None:
+      # save label checkpoint
+      with open(prediction_result_label_checkpoint_path, 'wb') as f:
+        pickle.dump(label, f, protocol=4)
+  else:
+    if label is None:
+      with open(prediction_result_label_checkpoint_path, 'rb') as f:
+        label = pickle.load(f)
 
   # Rank by model confidence.
   ranked_order = [
@@ -383,31 +486,44 @@ def predict_structure(
         model_type=model_type,
     )
 
-  # Write out relaxed PDBs in rank order.
+  # Write out relaxed PDB/CIFs (symlinks) in rank order.
   for idx, model_name in enumerate(ranked_order):
     ranked_output_path = os.path.join(output_dir, f'ranked_{idx}.pdb')
-    with open(ranked_output_path, 'w') as f:
-      if model_name in relaxed_pdbs:
-        f.write(relaxed_pdbs[model_name])
-      else:
-        f.write(unrelaxed_pdbs[model_name])
-
+    ranked_output_path_cif = os.path.join(output_dir, f'ranked_{idx}.cif')
+#    with open(ranked_output_path, 'w') as f:
     if model_name in relaxed_pdbs:
-      protein_instance = protein.from_pdb_string(relaxed_pdbs[model_name])
+      non_ranked_output_path = f'relaxed_{model_name}.pdb'
+      non_ranked_output_path_cif = f'relaxed_{model_name}.cif'
+      os.symlink(non_ranked_output_path,ranked_output_path)
+      os.symlink(non_ranked_output_path_cif,ranked_output_path_cif)
+#        f.write(relaxed_pdbs[model_name])
     else:
-      protein_instance = protein.from_pdb_string(unrelaxed_pdbs[model_name])
+      non_ranked_output_path = f'unrelaxed_{model_name}.pdb'
+      non_ranked_output_path_cif = f'unrelaxed_{model_name}.cif'
+      if os.path.exists(ranked_output_path):
+        os.remove(ranked_output_path)
+      os.symlink(non_ranked_output_path,ranked_output_path)
+      if os.path.exists(ranked_output_path_cif):
+        os.remove(ranked_output_path_cif)
+      os.symlink(non_ranked_output_path_cif,ranked_output_path_cif)
+#        f.write(unrelaxed_pdbs[model_name])
 
-    _save_mmcif_file(
-        prot=protein_instance,
-        output_dir=output_dir,
-        model_name=f'ranked_{idx}',
-        file_id=str(idx),
-        model_type=model_type,
-    )
+#    if model_name in relaxed_pdbs:
+#      protein_instance = protein.from_pdb_string(relaxed_pdbs[model_name])
+#    else:
+#      protein_instance = protein.from_pdb_string(unrelaxed_pdbs[model_name])
+
+#    _save_mmcif_file(
+#        prot=protein_instance,
+#        output_dir=output_dir,
+#        model_name=f'ranked_{idx}',
+#        file_id=str(idx),
+#        model_type=model_type,
+#    )
 
   ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
   with open(ranking_output_path, 'w') as f:
-    label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
+    #label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
     f.write(json.dumps(
         {label: ranking_confidences, 'order': ranked_order}, indent=4))
 
@@ -494,7 +610,8 @@ def main(argv):
       template_searcher=template_searcher,
       template_featurizer=template_featurizer,
       use_small_bfd=use_small_bfd,
-      use_precomputed_msas=FLAGS.use_precomputed_msas)
+      use_precomputed_msas=FLAGS.use_precomputed_msas,
+      n_parallel_msa=FLAGS.n_parallel_msa)
 
   if run_multimer_system:
     num_predictions_per_model = FLAGS.num_multimer_predictions_per_model
@@ -509,18 +626,67 @@ def main(argv):
 
   model_runners = {}
   model_names = config.MODEL_PRESETS[FLAGS.model_preset]
+  if FLAGS.stopat == 1:
+    model_names = [ "model_1_multimer_v3" ]
+  if FLAGS.stopat == 2:
+    model_names = [ "model_2_multimer_v3" ]
+  if FLAGS.stopat == 3:
+    model_names = [ "model_3_multimer_v3" ]
+  if FLAGS.stopat == 4:
+    model_names = [ "model_4_multimer_v3" ]
+  if FLAGS.stopat == 5:
+    model_names = [ "model_5_multimer_v3" ]
+
+  logging.info('Config file subbatch size %d', config.CONFIG_MULTIMER['model']['global_config']['subbatch_size'])
+  logging.info('Max #recycles %d', config.CONFIG_MULTIMER['model']['num_recycle'])
+  logging.info('Early stop tol %f', config.CONFIG_MULTIMER['model']['recycle_early_stop_tolerance'])
+  logging.info('Using stopat option = %d', FLAGS.stopat)
+
+  adaptative_subbatch_size = -1
+  max_num_res = 0
+  # Get max legnth of the sequences.
+  for i, fasta_path in enumerate(FLAGS.fasta_paths):
+    fasta_name = fasta_names[i]
+    with open(fasta_path) as f:
+      input_fasta_str = f.read()
+      input_seqs, _ = parsers.parse_fasta(input_fasta_str)
+      num_res = 0
+      for j in range(len(input_seqs)):
+        num_res += len(input_seqs[j])
+      if num_res > max_num_res:
+          max_num_res = num_res
+
+  if max_num_res < 512:
+    adaptative_subbatch_size = max_num_res
+  elif max_num_res >= 4500:
+    adaptative_subbatch_size = 1
+  elif max_num_res >= 4000:
+    adaptative_subbatch_size = 4
+  elif max_num_res >= 3000:
+    adaptative_subbatch_size = 32
+  elif max_num_res >= 2000:
+    adaptative_subbatch_size = 64
+  elif max_num_res >= 1500:
+    adaptative_subbatch_size = 128
+  elif max_num_res > 1000:
+    adaptative_subbatch_size = 256
+  elif max_num_res >= 512:
+    adaptative_subbatch_size = 512
+  logging.info('Adaptative subbatch size %d', adaptative_subbatch_size)
+
   for model_name in model_names:
     model_config = config.model_config(model_name)
+    model_config['model']['global_config']['subbatch_size'] = adaptative_subbatch_size
     if run_multimer_system:
       model_config.model.num_ensemble_eval = num_ensemble
     else:
       model_config.data.eval.num_ensemble = num_ensemble
+    model_config.model.save_recycled = FLAGS.save_recycled
     model_params = data.get_model_haiku_params(
         model_name=model_name, data_dir=FLAGS.data_dir)
     model_runner = model.RunModel(model_config, model_params)
     for i in range(num_predictions_per_model):
       model_runners[f'{model_name}_pred_{i}'] = model_runner
-
   logging.info('Have %d models: %s', len(model_runners),
                list(model_runners.keys()))
 
@@ -566,5 +732,7 @@ if __name__ == '__main__':
       'obsolete_pdbs_path',
       'use_gpu_relax',
   ])
-
+  if "TERM" in os.environ:
+    ncols = int(subprocess.check_output("tput cols", shell=True))
+    terminaltype = f"dumb {ncols},40"
   app.run(main)

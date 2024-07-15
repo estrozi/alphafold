@@ -1,3 +1,4 @@
+# syntax = edrevo/dockerfile-plus
 # Copyright 2021 DeepMind Technologies Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,8 @@ ARG GID
 ARG UNAME
 ARG UID
 RUN groupadd -g $GID -o racine
-RUN useradd -r -u $UID -g $GID $UNAME
+#RUN useradd -r -u $UID -g $GID $UNAME
+INCLUDE+ docker/Dockerfile.IBS
 
 # Use bash to support string substitution.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -39,9 +41,17 @@ RUN apt-get update \
         wget \
         gnuplot \
         tcsh \
+        libnss-ldapd nslcd \
+        libldap-common \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get autoremove -y \
     && apt-get clean
+
+#to allow ldap users acces.
+RUN \
+  sed -i '/^passwd:/ s/$/ ldap/' /etc/nsswitch.conf && \
+  sed -i '/^group:/ s/$/ ldap/' /etc/nsswitch.conf && \ 
+  sed -i 's~^#tls_reqcert never~tls_reqcert try~' /etc/nslcd.conf
 
 # Compile HHsuite from source.
 RUN git clone --branch v3.3.0 https://github.com/soedinglab/hh-suite.git /tmp/hh-suite \
@@ -56,12 +66,9 @@ RUN git clone --branch v3.3.0 https://github.com/soedinglab/hh-suite.git /tmp/hh
 # Install Miniconda package manager.
 ARG MINICONDA_FILE='Miniconda3-py310_24.1.2-0-Linux-x86_64.sh'
 RUN wget -q -P /tmp \
-#  https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
     "https://repo.anaconda.com/miniconda/${MINICONDA_FILE}" \
     && bash /tmp/${MINICONDA_FILE} -b -p /opt/conda \
-#    && bash /tmp/Miniconda3-latest-Linux-x86_64.sh -b -p /opt/conda \
     && rm /tmp/${MINICONDA_FILE}
-#    && rm /tmp/Miniconda3-latest-Linux-x86_64.sh
 
 # Install conda packages.
 ENV PATH="/opt/conda/bin:$PATH"
@@ -71,9 +78,10 @@ ENV LD_LIBRARY_PATH="/opt/conda/lib:$LD_LIBRARY_PATH"
 #    && conda install -y -c conda-forge openmm=8.0.0 pdbfixer cuda-toolkit=${CUDA_VERSION} \
 #    && conda clean --all --force-pkgs-dirs --yes \
 #    && conda install cuda -c nvidia/label/cuda-11.8.0
-RUN conda install -qy conda==23.5.2 \
+#RUN conda install -qy conda==23.5.2 \
+RUN conda install -qy conda \
     && conda install -y -c conda-forge \
-      openmm=7.7.0 \
+      openmm=8.0.0 \
       cudatoolkit==${CUDA_VERSION} \
       pdbfixer \
       pip \
@@ -89,8 +97,8 @@ RUN wget -q -P /app/alphafold/alphafold/common/ \
 RUN pip3 install --upgrade pip --no-cache-dir \
     && pip3 install -r /app/alphafold/requirements.txt --no-cache-dir \
     && pip3 install --upgrade --no-cache-dir \
-      jax==0.4.19 \
-      jaxlib==0.4.19+cuda11.cudnn86 \
+      jax==0.3.25 \
+      jaxlib==0.3.25+cuda11.cudnn805 \
       -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 

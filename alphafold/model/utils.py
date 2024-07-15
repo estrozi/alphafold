@@ -163,9 +163,10 @@ def padding_consistent_rng(f):
   def inner(key, shape, **kwargs):
     keys = grid_keys(key, shape)
     signature = (
-        '()->()'
-        if jax.dtypes.issubdtype(keys.dtype, jax.dtypes.prng_key)
-        else '(2)->()'
+#        '()->()'
+#        if jax.dtypes.issubdtype(keys.dtype, jax.dtypes.prng_key)
+#        else '(2)->()'
+        '()->()' if isinstance(keys, jax.random.PRNGKeyArray) else '(2)->()'
     )
     return jnp.vectorize(
         functools.partial(f, shape=(), **kwargs), signature=signature

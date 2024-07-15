@@ -151,6 +151,10 @@ flags.DEFINE_integer('save_recycled', 2, '0 - no recycle info saving, 1 - print 
 flags.DEFINE_string('checkpoint_tag', 'checkpoint', 'Enable checkpoint and use the tag to name '
                     'files to restart the recycle modeling later.')
 flags.DEFINE_integer('stopat', 6, 'which model to use and when to stop. Allows parallel inference with the 5 models. 0=MSA, 1=model_1_multimer_v3, 2=model_2, 3=model_3, 4=model_4, 5=model_5, 6=up to final part (ranking, etc)')
+flags.DEFINE_boolean('adapt_subbatch', True, 'Whether to choose a better subbatch_size '
+                     ' than the 4 by default.')
+flags.DEFINE_integer('max_n_recycles', 20, 'Maximum number of recycles')
+flags.DEFINE_float('recycle_early_stop_tolerance', 0.5, 'RMSD threshold for early recycle stop')
 
 FLAGS = flags.FLAGS
 
@@ -269,12 +273,31 @@ def predict_structure(
   timings['features'] = time.time() - t_0
 
   msa = feature_dict['msa']
-  nal = (msa != 21).sum(0)
+  non_gaps = (msa != 21)
+  nal = non_gaps.sum(0)
   gnuplotlib.plot(nal, terminal=terminaltype)
   if ( (nal < 30).sum(0) > 0 ):
     logging.info(f'The MSA alignment depth is less than 30 sequences at the '
                  f'positions below. You may consider spliting into shorter chains.' )
     logging.info([i for i in range(len(nal)) if nal[i] < 30])
+  seqid = (np.array(msa[0] == msa).mean(-1))
+  seqid_sort = seqid.argsort()
+  non_gaps = non_gaps.astype(float)
+  non_gaps[non_gaps == 0] = np.nan
+  msa_depth = non_gaps[seqid_sort] * seqid[seqid_sort, None]
+  figMSA = plt.figure(figsize=(6, 6), dpi=150)
+  plt.subplot(1, 1, 1)
+  plt.title("Sequence coverage")
+  plt.imshow(msa_depth,interpolation='nearest', aspect='auto',cmap="rainbow_r", vmin=0, vmax=1, origin='lower')
+  plt.plot((msa != 21).sum(0), color='black')
+  plt.xlim(-0.5, msa.shape[1] - 0.5)
+  plt.ylim(-0.5, msa.shape[0] - 0.5)
+  plt.colorbar(label="Sequence identity to query", )
+  plt.xlabel("Positions")
+  plt.ylabel("Sequences")
+  plt.savefig(os.path.join(output_dir,'msa_depth.png'))
+  plt.close(figMSA)
+
   if FLAGS.stopat == 0:
     raise app.UsageError('Using stopat 0 (MSA only)', 0)
 
@@ -375,8 +398,8 @@ def predict_structure(
       pae_outputs = {'protein': (np_prediction_result['predicted_aligned_error'], prediction_result['max_predicted_aligned_error'])}
       pae, max_pae = list(pae_outputs.values())[0]
       pae_output_path = os.path.join(output_dir, f'unrelaxed_{model_name}_pae.png')
-      fig = plt.figure()
-      fig.set_facecolor('white')
+      figPAE = plt.figure()
+      figPAE.set_facecolor('white')
       plt.imshow(pae, vmin=0., vmax=max_pae)
       plt.colorbar(fraction=0.46, pad=0.04)
       plt.title('Predicted Aligned Error')
@@ -638,45 +661,50 @@ def main(argv):
     model_names = [ "model_5_multimer_v3" ]
 
   logging.info('Config file subbatch size %d', config.CONFIG_MULTIMER['model']['global_config']['subbatch_size'])
-  logging.info('Max #recycles %d', config.CONFIG_MULTIMER['model']['num_recycle'])
-  logging.info('Early stop tol %f', config.CONFIG_MULTIMER['model']['recycle_early_stop_tolerance'])
+  logging.info('Config file Max #recycles %d', config.CONFIG_MULTIMER['model']['num_recycle'])
+  logging.info('Config file Early stop tol %f', config.CONFIG_MULTIMER['model']['recycle_early_stop_tolerance'])
   logging.info('Using stopat option = %d', FLAGS.stopat)
 
-  adaptative_subbatch_size = -1
-  max_num_res = 0
-  # Get max legnth of the sequences.
-  for i, fasta_path in enumerate(FLAGS.fasta_paths):
-    fasta_name = fasta_names[i]
-    with open(fasta_path) as f:
-      input_fasta_str = f.read()
-      input_seqs, _ = parsers.parse_fasta(input_fasta_str)
-      num_res = 0
-      for j in range(len(input_seqs)):
-        num_res += len(input_seqs[j])
-      if num_res > max_num_res:
-          max_num_res = num_res
+  adaptative_subbatch_size = 4
+  if FLAGS.adapt_subbatch:
+    max_num_res = 0
+    # Get max legnth of the sequences.
+    for i, fasta_path in enumerate(FLAGS.fasta_paths):
+      fasta_name = fasta_names[i]
+      with open(fasta_path) as f:
+        input_fasta_str = f.read()
+        input_seqs, _ = parsers.parse_fasta(input_fasta_str)
+        num_res = 0
+        for j in range(len(input_seqs)):
+          num_res += len(input_seqs[j])
+        if num_res > max_num_res:
+            max_num_res = num_res
+    if max_num_res < 512:
+      adaptative_subbatch_size = max_num_res
+    elif max_num_res >= 4500:
+      adaptative_subbatch_size = 1
+    elif max_num_res >= 4000:
+      adaptative_subbatch_size = 4
+    elif max_num_res >= 3000:
+      adaptative_subbatch_size = 32
+    elif max_num_res >= 2000:
+      adaptative_subbatch_size = 64
+    elif max_num_res >= 1500:
+      adaptative_subbatch_size = 128
+    elif max_num_res > 1000:
+      adaptative_subbatch_size = 256
+    elif max_num_res >= 512:
+      adaptative_subbatch_size = 512
 
-  if max_num_res < 512:
-    adaptative_subbatch_size = max_num_res
-  elif max_num_res >= 4500:
-    adaptative_subbatch_size = 1
-  elif max_num_res >= 4000:
-    adaptative_subbatch_size = 4
-  elif max_num_res >= 3000:
-    adaptative_subbatch_size = 32
-  elif max_num_res >= 2000:
-    adaptative_subbatch_size = 64
-  elif max_num_res >= 1500:
-    adaptative_subbatch_size = 128
-  elif max_num_res > 1000:
-    adaptative_subbatch_size = 256
-  elif max_num_res >= 512:
-    adaptative_subbatch_size = 512
   logging.info('Adaptative subbatch size %d', adaptative_subbatch_size)
 
   for model_name in model_names:
     model_config = config.model_config(model_name)
     model_config['model']['global_config']['subbatch_size'] = adaptative_subbatch_size
+    model_config['model']['num_recycle'] = FLAGS.max_n_recycles
+    model_config['model']['recycle_early_stop_tolerance'] = FLAGS.recycle_early_stop_tolerance
+    logging.info('Using num_recycle %d',model_config['model']['num_recycle'])
+    logging.info('Using recycle_early_stop_tolerance %f',model_config['model']['recycle_early_stop_tolerance'])
     if run_multimer_system:
       model_config.model.num_ensemble_eval = num_ensemble
     else:

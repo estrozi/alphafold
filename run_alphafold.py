@@ -150,7 +150,7 @@ flags.DEFINE_integer('save_recycled', 2, '0 - no recycle info saving, 1 - print 
                     'dictionaries of each recycling iteration.', lower_bound=0, upper_bound=3)
 flags.DEFINE_string('checkpoint_tag', 'checkpoint', 'Enable checkpoint and use the tag to name '
                     'files to restart the recycle modeling later.')
-flags.DEFINE_integer('stopat', 6, 'which model to use and when to stop. Allows parallel inference with the 5 models. 0=MSA, 1=model_1_multimer_v3, 2=model_2, 3=model_3, 4=model_4, 5=model_5, 6=up to final part (ranking, etc)')
+flags.DEFINE_integer('stopat', 6, 'which model to use and when to stop. Allows parallel inference with the 5 models. 0=MSA-only, 1=model_1_multimer_v3, 2=model_2, 3=model_3, 4=model_4, 5=model_5, 6=all models and final part (ranking, etc), 7=only final part (ranking, etc)')
 flags.DEFINE_boolean('adapt_subbatch', True, 'Whether to choose a better subbatch_size '
                      ' than the 4 by default.')
 flags.DEFINE_integer('max_n_recycles', 20, 'Maximum number of recycles')
@@ -318,7 +318,7 @@ def predict_structure(
     unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
     unrelaxed_proteins_checkpoint_path = os.path.join(output_dir, f'unrelaxed_proteins_{model_name}_checkpoint.pkl')
     ranking_confidences_checkpoint_path = os.path.join(output_dir, f'ranking_confidences_{model_name}_checkpoint.pkl')
-    if not os.path.exists(os.path.join(output_dir, f'result_{model_name}.pkl')):
+    if not os.path.exists(os.path.join(output_dir, f'result_{model_name}.pkl')) and FLAGS.stopat != 7:
       logging.info('Running model %s on %s', model_name, fasta_name)
       prev_ckpt = None; prev_ckpt_iter = 0
       model_runner.checkpoint_file = None
@@ -445,12 +445,15 @@ def predict_structure(
         pickle.dump(ranking_confidences[model_name], f, protocol=4)
     else:
       # read checkpoints
-      with open(unrelaxed_pdb_path, 'r') as f:
-        unrelaxed_pdbs[model_name] = f.read()
-      with open(unrelaxed_proteins_checkpoint_path, 'rb') as f:
-        unrelaxed_proteins[model_name] = pickle.load(f)
-      with open(ranking_confidences_checkpoint_path, 'rb') as f:
-        ranking_confidences[model_name] = pickle.load(f)
+      if os.path.exists(unrelaxed_pdb_path):
+        with open(unrelaxed_pdb_path, 'r') as f:
+          unrelaxed_pdbs[model_name] = f.read()
+      if os.path.exists(unrelaxed_proteins_checkpoint_path):
+        with open(unrelaxed_proteins_checkpoint_path, 'rb') as f:
+          unrelaxed_proteins[model_name] = pickle.load(f)
+      if os.path.exists(ranking_confidences_checkpoint_path):
+        with open(ranking_confidences_checkpoint_path, 'rb') as f:
+          ranking_confidences[model_name] = pickle.load(f)
 
   if FLAGS.stopat < 6:
     raise app.UsageError('Interrupting because stopat < 6', 0)

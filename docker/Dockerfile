@@ -1,4 +1,3 @@
-# syntax = edrevo/dockerfile-plus
 # Copyright 2021 DeepMind Technologies Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,13 +17,10 @@ FROM nvidia/cuda:${CUDA}-cudnn8-runtime-ubuntu18.04
 # FROM directive resets ARGS, so we specify again (the value is retained if
 # previously set).
 ARG CUDA
-#From https://stackoverflow.com/questions/44683119/dockerfile-replicate-the-host-user-uid-and-gid-to-the-image
-ARG GID
 ARG UNAME
-ARG UID
-RUN groupadd -g $GID -o racine
-#RUN useradd -r -u $UID -g $GID $UNAME
-INCLUDE+ docker/Dockerfile.IBS
+ARG GID
+ARG GNAME
+RUN groupadd -g $GID -o $GNAME
 
 # Use bash to support string substitution.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -64,29 +60,33 @@ RUN git clone --branch v3.3.0 https://github.com/soedinglab/hh-suite.git /tmp/hh
     && rm -rf /tmp/hh-suite
 
 # Install Miniconda package manager.
-ARG MINICONDA_FILE='Miniconda3-py310_24.1.2-0-Linux-x86_64.sh'
+#ARG MINICONDA_FILE='Miniconda3-py310_24.1.2-0-Linux-x86_64.sh'
+ARG MINIFORGE_FILE='Miniforge3-24.3.0-0-Linux-x86_64.sh'
 RUN wget -q -P /tmp \
-    "https://repo.anaconda.com/miniconda/${MINICONDA_FILE}" \
-    && bash /tmp/${MINICONDA_FILE} -b -p /opt/conda \
-    && rm /tmp/${MINICONDA_FILE}
+#    "https://repo.anaconda.com/miniconda/${MINICONDA_FILE}" \
+#    && bash /tmp/${MINICONDA_FILE} -b -p /opt/conda \
+#    && rm /tmp/${MINICONDA_FILE}
+    "https://github.com/conda-forge/miniforge/releases/download/24.3.0-0/${MINIFORGE_FILE}" \
+    && bash /tmp/${MINIFORGE_FILE} -b -p /opt/conda \
+    && rm /tmp/${MINIFORGE_FILE}
 
 # Install conda packages.
 ENV PATH="/opt/conda/bin:$PATH"
 ENV LD_LIBRARY_PATH="/opt/conda/lib:$LD_LIBRARY_PATH"
-#RUN conda install -qy conda==24.1.2 pip python=3.11 \
-#    && conda install -y -c nvidia cuda=${CUDA_VERSION} \
-#    && conda install -y -c conda-forge openmm=8.0.0 pdbfixer cuda-toolkit=${CUDA_VERSION} \
+#RUN conda install --solver=classic -qy conda==24.1.2 pip python=3.11 \
+#    && conda install --solver=classic -y -c nvidia cuda=${CUDA_VERSION} \
+#    && conda install --solver=classic -y -c conda-forge openmm=8.0.0 pdbfixer cuda-toolkit=${CUDA_VERSION} \
 #    && conda clean --all --force-pkgs-dirs --yes \
-#    && conda install cuda -c nvidia/label/cuda-11.8.0
-#RUN conda install -qy conda==23.5.2 \
-RUN conda install -qy conda \
-    && conda install -y -c conda-forge \
+#    && conda install --solver=classic cuda -c nvidia/label/cuda-11.8.0
+#RUN conda install --solver=classic -qy conda==23.5.2 \
+RUN conda install --solver=classic -qy conda \
+    && conda install --solver=classic -y -c conda-forge \
       openmm=8.0.0 \
       cudatoolkit==${CUDA_VERSION} \
       pdbfixer \
       pip \
       python=3.10 \
-      && conda install -c nvidia cuda-nvcc \
+      && conda install --solver=classic -c nvidia cuda-nvcc \
       && conda clean --all --force-pkgs-dirs --yes
 
 COPY . /app/alphafold
@@ -119,5 +119,5 @@ RUN echo $'#!/bin/bash\n\
 ldconfig\n\
 python /app/alphafold/run_alphafold.py "$@"' > /app/run_alphafold.sh \
   && chmod 755       /app/run_alphafold.sh
-USER $UNAME
+USER $UNAME:$GNAME
 ENTRYPOINT ["/app/run_alphafold.sh"]
